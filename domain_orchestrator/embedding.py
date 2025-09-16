@@ -40,7 +40,10 @@ class ClipEmbeddingModel(EmbeddingModel):
             self.llava_processor = LlavaProcessor.from_pretrained(
                 "llava-hf/llava-1.5-7b-hf"
             )
-            self.prompt = "Describe this image in detail. In your description, specifically mention ALL VISIBLE parts of each object in the image. Please, don't generate any blank spaces or new lines in your description."
+            self.prompt = "Describe what's present in the image in this format: 'A photo of a [object1], [object2], [object3] in the scene' depending on how many major objects are present in the image."
+            #self.prompt = "Describe the visual features of the image in only one sentence."
+            # self.prompt = "Describe this image in detail. In your description, specifically mention ALL VISIBLE parts of each object in the image. Please, don't generate any blank spaces or new lines in your description."
+            #self.prompt = "Describe the total opposite of what is there in the image. Please, don't generate any blank spaces or new lines in your description. Also don't use any preamble like 'this is the total opposite of what is there in the image'. Just describe the total opposite of what is there in the image."
             self.conversation = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": self.prompt}]}]
 
     def embed_image(self, image_path) -> npt.NDArray:
@@ -248,6 +251,9 @@ class EmbeddingManager:
             print("Generating text embeddings in batches...")
             captions = self.embedding_model.generate_captions_batch(image_files, batch_size=128)
             
+            # Calculate and print cosine similarities
+            cosine_similarities = []
+            
             for i, (img, caption) in enumerate(tqdm(zip(image_files, captions), desc="Generating text embeddings", total=len(image_files))):
                 if caption:  # Only process if caption was generated successfully
                     caption_embedding = self.embedding_model.embed_text(caption)
@@ -255,8 +261,33 @@ class EmbeddingManager:
                     if caption_embedding is not None:
                         dataset_text_embeddings.append(caption_embedding)
                         
-                        # calculate mixed embeddings
-                        mixed_embedding = self.image_weight * dataset_embeddings[i] + self.text_weight * caption_embedding
+                        # Calculate cosine similarity between image and text embeddings
+                        image_emb = dataset_embeddings[i]
+                        text_emb = caption_embedding
+                        
+                        # Normalize embeddings for cosine similarity
+                        image_emb_norm = image_emb / np.linalg.norm(image_emb)
+                        text_emb_norm = text_emb / np.linalg.norm(text_emb)
+                        
+                        # Calculate cosine similarity
+                        cosine_sim = np.dot(image_emb_norm.flatten(), text_emb_norm.flatten())
+                        cosine_similarities.append(cosine_sim)
+
+                        text_along_image = cosine_sim * text_emb
+                        text_along_image_norm = np.linalg.norm(text_along_image)
+                        text_orthogonal_to_image = text_emb - text_along_image
+                        text_orthogonal_to_image_norm = np.linalg.norm(text_orthogonal_to_image)
+                        
+                        # Print similarity for first few images and some random samples
+                        #if i < 5 or i % 100 == 0:
+                        print(f"Image {i}: {img.name}")
+                        print(f"  Caption: {caption}")
+                        print(f"  Cosine similarity: {cosine_sim:.4f}")
+                        print(f"  Text along image: {text_along_image_norm:.4f}")
+                        print(f"  Text orthogonal to image: {text_orthogonal_to_image_norm:.4f}")
+                        
+                        # calculate mixed embeddings (changed to text_along_image)
+                        mixed_embedding = 1 * dataset_embeddings[i] + self.text_weight * text_orthogonal_to_image
                         dataset_mixed_embeddings.append(mixed_embedding)
                     else:
                         raise ValueError(f"Error embedding text for image '{img}'.")
@@ -468,8 +499,14 @@ class EmbeddingManager:
                     batch_text_embeddings.append(text_embedding)
                 
                 # Calculate weighted embeddings for the batch
+                # make changes to calculate weighted embeddings in directed way
                 for img_emb, txt_emb in zip(batch_image_embeddings, batch_text_embeddings):
-                    weighted_embedding = self.image_weight * img_emb + self.text_weight * txt_emb
+                    image_emb_norm = img_emb / np.linalg.norm(img_emb)
+                    text_emb_norm = txt_emb / np.linalg.norm(txt_emb)
+                    cosine_sim = np.dot(image_emb_norm.flatten(), text_emb_norm.flatten())
+                    text_along_image = cosine_sim * txt_emb
+                    text_orthogonal_to_image = txt_emb - text_along_image
+                    weighted_embedding = 1 * img_emb + self.text_weight * text_orthogonal_to_image
                     all_weighted_embeddings.append(weighted_embedding)
             else:
                 # Return only image embeddings if text is not enabled
