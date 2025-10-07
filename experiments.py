@@ -87,13 +87,73 @@ def semla_merge(source_domains: List[str], target_domains: List[str],
     )
     save_results(results, weights, output_dir=output_dir)
 
+# TODO: maybe train the gating network elsewhere instead of in the benchmark step
+def semla_moe_merge(source_domains: List[str], target_domains: List[str], 
+                   config: Dict[str, Any], remove_target_adapter: bool, 
+                   output_dir: str) -> None:
+    """Run MoE-based merge experiment."""
+    top_k = config.get("top_k", 5)
+    combination_type = config.get("combination_type", "cat")
+    
+    orchestrator = DomainOrchestrator(source_domains)
+    
+    # Create log directory for MoE weight distribution
+    moe_log_dir = os.path.join(output_dir, "moe_weight_logs")
+    
+    # Train gating network with LoRA adapters for each target domain separately
+    results = {}
+    weights = {}
+    
+    for target_domain in target_domains:
+        print(f"Training MoE gating network for target domain: {target_domain}")
+        
+        # Remove target domain from source domains for training
+        if remove_target_adapter:
+            training_domains = [d for d in source_domains if d != target_domain]
+        else:
+            training_domains = source_domains
+        
+        # Train gating network with filtered domains
+        print(f"Training gating network with domains: {training_domains}")
+        orchestrator.train_moe_gating_network(
+            source_domains=training_domains,
+            epochs=config.get("epochs", 100),
+            learning_rate=config.get("learning_rate", 0.001),
+            batch_size=config.get("batch_size", 32),
+            validation_split=config.get("validation_split", 0.2)
+        )
+        #orchestrator.train_mixture_of_experts_with_adapters(
+        #    source_domains=training_domains,
+        #    epochs=config.get("epochs", 100),
+        #    learning_rate=config.get("learning_rate", 0.001),
+        #    batch_size=config.get("batch_size", 8),  # Use smaller batch size
+        #    validation_split=config.get("validation_split", 0.2),
+        #    hidden_dim=config.get("hidden_dim", 512),
+        #    log_dir=os.path.join(output_dir, f"moe_training_{target_domain}")
+        #)
+        
+        # Run benchmark for this target domain
+        target_results, target_weights = orchestrator.benchmark_semla_moe(
+            target_domains=[target_domain],
+            remove_target_adapter=remove_target_adapter,
+            top_k=top_k,
+            combination_type=combination_type,
+            log_dir=moe_log_dir
+        )
+        
+        results.update(target_results)
+        weights.update(target_weights)
+    
+    save_results(results, weights, output_dir=output_dir)
+    print(f"MoE weight distribution logs saved to: {moe_log_dir}")
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Domain adaptation experiments")
     
     # Required arguments
     parser.add_argument("--experiment", type=str, required=True, 
-                        choices=["zeroshot", "oracle", "uniform", "semla"],
+                        choices=["zeroshot", "oracle", "uniform", "semla", "semla_moe"],
                         help="Type of experiment to run")
     
     # Optional arguments with defaults
@@ -133,6 +193,8 @@ def main():
         uniform_merge(source_domains, target_domains, args.remove_target_adapter, args.output_dir)
     elif args.experiment == "semla":
         semla_merge(source_domains, target_domains, semla_config, args.remove_target_adapter, args.output_dir)
+    elif args.experiment == "semla_moe":
+        semla_moe_merge(source_domains, target_domains, semla_config, args.remove_target_adapter, args.output_dir)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,8 @@
+# MoE Configuration for SemLA
+top_k: 4
+combination_type: cat
+epochs: 5
+learning_rate: 0.0001
+batch_size: 16
+validation_split: 0.1
+hidden_dim: 768 # clip embedding dim

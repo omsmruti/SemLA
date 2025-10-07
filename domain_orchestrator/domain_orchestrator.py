@@ -6,13 +6,20 @@ from argparse import Namespace
 from dataclasses import dataclass
 import logging
 import os
+import csv
+import json
+from datetime import datetime
 
 import numpy as np
 import numpy.typing as npt
+from typing import Optional
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.model_selection import train_test_split
 
 import peft
 
@@ -31,6 +38,7 @@ def softmax(x: list[float], softmax_temperature) -> np.ndarray:
     # Add error handling for division by zero
     if softmax_temperature == 0:
         softmax_temperature = 1e-6
+    print(f"softmax_temperature being used is {softmax_temperature}")
     exp_x = np.exp(np.divide(x, softmax_temperature))
     return exp_x / np.sum(exp_x, axis=0)
 
@@ -47,6 +55,55 @@ class Domain:
     lora_path: Path = None
 
 
+
+class MoEGatingNetwork(nn.Module):
+    """Mixture of Experts Gating Network for LoRA adapter weights"""
+    
+    def __init__(self, input_dim: int, num_domains: int, hidden_dim: int = 512):
+        super(MoEGatingNetwork, self).__init__()
+        self.input_dim = input_dim
+        self.num_domains = num_domains
+        self.hidden_dim = hidden_dim
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, num_domains)
+        )
+        print("MoEGatingNetwork init params: --------------------------------")
+        print(input_dim, num_domains, hidden_dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the gating network."""
+        return self.network(x)
+    
+    def get_top_k_weights(self, x: torch.Tensor, top_k: int, temperature: float = 2) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get top-k domain weights and indices."""
+        # 1.5 (17.93), 10(18.24), 5(18.29), 4(18.30), 3(18.27), 2(18.11)
+        logits = self.forward(x)
+        scaled_logits = logits / temperature
+        # Get top-k values and indices from raw logits
+        top_k_logits, top_k_indices = torch.topk(scaled_logits, top_k, dim=-1)
+        
+        # Create mask of -inf for all logits except top-k
+        mask = torch.full_like(scaled_logits, float('-inf'))
+        mask.scatter_(1, top_k_indices, top_k_logits)
+        
+        # Apply softmax to masked logits
+        probs = F.softmax(mask, dim=-1)
+        print(f"probs are {probs}")
+        
+        # Get top-k values and indices
+        top_k_values, top_k_indices = torch.topk(probs, top_k, dim=-1)
+        
+        return top_k_values, top_k_indices
+        
+
+
 class DomainObserver:
     """Observer class that holds and manages a collection of Domains."""
 
@@ -54,6 +111,9 @@ class DomainObserver:
         self,
     ) -> None:
         self.domain_prototypes = {}
+        self.gating_network = None
+        self.domain_to_index = {}
+        self.index_to_domain = {}
 
     def add_domain_prototypes(
         self,
@@ -85,6 +145,448 @@ class DomainObserver:
         # sort similarities from lowest to highest
         similarities_dict = dict(sorted(similarities, key=lambda x: x[1], reverse=sort_descending))
         return similarities_dict
+    
+    def calculate_moe_similarity_to_domains(
+        self,
+        embedding: npt.NDArray,
+        domains: list[Domain],
+        top_k: int = 5,
+        filename: str = None,
+        log_file_handle = None
+    ) -> Dict[str, float]:
+
+        # convert embedding to tensor
+        device = next(self.gating_network.parameters()).device
+        embedding_tensor = torch.tensor(embedding, dtype=torch.float32).to(device)
+        top_k_weights, top_k_indices = self.gating_network.get_top_k_weights(embedding_tensor, top_k)
+        #print(f"shape of top_k_weights are {top_k_weights.shape}")
+        #print(f"shape of top_k_indices are {top_k_indices.shape}")
+
+        top_k_weights = top_k_weights.squeeze(0).detach().cpu().numpy()
+        # TODO: Check if this is correct way to normalize the weights
+        # top_k_weights = top_k_weights / np.sum(top_k_weights)
+        print(f"top_k_weights are {top_k_weights}")
+        top_k_indices = top_k_indices.squeeze(0).detach().cpu().numpy()
+
+        # Log to console
+        print(f"\n=== MoE Weight Distribution ===")
+        if filename:
+            print(f"File: {filename}")
+        print(f"Top-{top_k} selected domains and weights:")
+        
+        domain_weights = {}
+        for i, (weight, idx) in enumerate(zip(top_k_weights, top_k_indices)):
+            domain_name = self.index_to_domain[idx]
+            domain_weights[domain_name] = float(weight)
+            
+            # Log to console
+            print(f"  Rank {i+1}: {domain_name} (weight: {weight:.4f})")
+            
+            # Log to CSV if file handle is provided
+            if log_file_handle:
+                writer = csv.writer(log_file_handle)
+                writer.writerow([
+                    filename or "unknown",
+                    i + 1,
+                    domain_name,
+                    float(weight),
+                    top_k
+                ])
+        
+        return domain_weights
+
+
+    # TODO: try various ways of training the gating network
+    def train_gating_network(
+        self,
+        domains: list[Domain],
+        embedding_manager: EmbeddingManager,
+        epochs: int = 100,
+        learning_rate: float = 0.001,
+        batch_size: int = 32,
+        validation_split: float = 0.2,
+        hidden_dim: int = 512,
+        log_dir: str = "./moe_training_logs"
+    ) -> None:
+        """
+        Train the MoE gating network using data from all source domains.
+        """
+        print("Training MoE gating network...")
+
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"training_log_{timestamp}.txt")
+        # csv_file = os.path.join(log_dir, f"training_metrics_{timestamp}.csv")
+
+        # Initialize csv logging
+        with open(log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['epoch', 'train_loss', 'train_accuracy', 'val_loss', 'val_accuracy'])
+        
+        # Set up domain mapping
+        self.domain_to_index = {domain.name: i for i, domain in enumerate(domains)}
+        self.index_to_domain = {i: domain.name for i, domain in enumerate(domains)}
+        
+        # Collect embeddings and labels from all domains
+        all_embeddings = []
+        all_labels = []
+        
+        for domain in domains:
+            print(f"Collecting embeddings from domain: {domain.name}")
+            
+            # Get training data loader
+            data_loader = domain.data_loader
+            
+            domain_embeddings = []
+            for inputs in data_loader:
+                input_path = inputs[0]["file_name"]
+                embedding = embedding_manager.embed_image(input_path)
+                domain_embeddings.append(embedding)
+            
+            # Convert to numpy arrays
+            domain_embeddings = np.array(domain_embeddings)
+            domain_labels = np.full(len(domain_embeddings), self.domain_to_index[domain.name])
+            
+            all_embeddings.append(domain_embeddings)
+            all_labels.append(domain_labels)
+        
+        # Concatenate all data
+        X = np.vstack(all_embeddings).squeeze(1) # remove first dimension (=1)
+        y = np.concatenate(all_labels)
+        print(f"shape of X and y are {X.shape} and {y.shape}")
+        
+        # Split into train/validation
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=validation_split, random_state=42, stratify=y
+        )
+        
+        # Convert to tensors
+        X_train = torch.tensor(X_train, dtype=torch.float32)
+        X_val = torch.tensor(X_val, dtype=torch.float32)
+        y_train = torch.tensor(y_train, dtype=torch.long)
+        y_val = torch.tensor(y_val, dtype=torch.long)
+        
+        # Create data loaders
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        
+        # Initialize gating network
+        input_dim = X.shape[1]
+        num_domains = len(domains)
+        self.gating_network = MoEGatingNetwork(input_dim, num_domains, hidden_dim=768)
+        
+        # Set up training
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.gating_network.to(device)
+        
+        optimizer = optim.Adam(self.gating_network.parameters(), lr=learning_rate)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Training loop
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            # Training
+            self.gating_network.train()
+            train_loss = 0.0
+            train_accuracy = 0.0
+            for batch_X, batch_y in train_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                optimizer.zero_grad()
+                print(f"input shape is {batch_X.shape}")
+                outputs = self.gating_network(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+
+                _, predicted = torch.max(outputs.data, 1)
+                train_accuracy += (predicted == batch_y).sum().item()
+            
+            # Validation
+            self.gating_network.eval()
+            val_loss = 0.0
+            val_accuracy = 0.0
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    outputs = self.gating_network(batch_X)
+                    loss = criterion(outputs, batch_y)
+                    val_loss += loss.item()
+                    
+                    # Calculate accuracy
+                    _, predicted = torch.max(outputs.data, 1)
+                    val_accuracy += (predicted == batch_y).sum().item()
+            
+            train_loss /= len(train_loader)
+            val_loss /= len(val_loader)
+            train_accuracy /= len(train_dataset)
+            val_accuracy /= len(val_dataset)
+            print(f"length of train_loader is {len(train_loader)}")
+            print(f"length of val_loader is {len(val_loader)}")
+            print(f"length of train_dataset is {len(train_dataset)}")
+            print(f"length of val_dataset is {len(val_dataset)}")
+            
+            print(f"Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+            
+            with open(log_file, 'a') as f:
+                f.write(f"Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}\n")            
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+        
+        print("MoE gating network training completed!")
+
+    def train_moe_with_adapters(
+        self,
+        source_domains: list[str],
+        epochs: int = 100,
+        learning_rate: float = 0.001,
+        batch_size: int = 8,  # Small batch size as requested
+        validation_split: float = 0.2,
+        hidden_dim: int = 512,
+        log_dir: str = "./moe_training_logs"
+    ) -> None:
+        """
+        Train the MoE gating network jointly with all LoRA adapters using segmentation loss.
+        Training is done sequentially on each source domain dataset.
+        """
+        
+        print("Training MoE gating network with LoRA adapters using segmentation loss...")
+        
+        # Create log directory
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Set up logging files
+        log_file = os.path.join(log_dir, f"moe_training_log_{timestamp}.txt")
+        csv_file = os.path.join(log_dir, f"moe_training_metrics_{timestamp}.csv")
+        
+        # Initialize CSV logging
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['domain', 'epoch', 'train_loss', 'val_loss'])
+        
+        # Get domain objects
+        domains = [self._source_domains[name] for name in source_domains]
+        
+        # Initialize gating network
+        embedding_dim = 768  # CLIP embedding dimension
+        num_domains = len(domains)
+        self.observer.gating_network = MoEGatingNetwork(embedding_dim, num_domains, hidden_dim)
+        
+        # Set up domain mapping
+        self.observer.domain_to_index = {domain.name: i for i, domain in enumerate(domains)}
+        self.observer.index_to_domain = {i: domain.name for i, domain in enumerate(domains)}
+        
+        # Initialize model with all adapters loaded
+        self._initialize_model_with_adapters(domains)
+        
+        # Training loop - sequential training on each domain
+        for domain_idx, domain in enumerate(domains):
+            print(f"\n=== Training on domain: {domain.name} ({domain_idx + 1}/{len(domains)}) ===")
+            
+            # Get data loader for this domain
+            data_loader = domain.data_loader
+            
+            # Split data for validation
+            total_samples = len(data_loader.dataset)
+            val_size = int(total_samples * validation_split)
+            train_size = total_samples - val_size
+            
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                data_loader.dataset, [train_size, val_size]
+            )
+            
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=batch_size, shuffle=False
+            )
+            
+            # Set up training for this domain
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.current_model.to(device)
+            self.observer.gating_network.to(device)
+            
+            # Optimizer for both gating network and all LoRA adapters
+            optimizer = optim.Adam(
+                list(self.observer.gating_network.parameters()) + 
+                list(self.current_model.parameters()),
+                lr=learning_rate
+            )
+            
+            # Training loop for this domain
+            best_val_loss = float('inf')
+            patience = 10
+            patience_counter = 0
+            
+            for epoch in range(epochs):
+                # Training
+                self.current_model.train()
+                self.observer.gating_network.train()
+                train_loss = 0.0
+                
+                for batch_data in train_loader:
+                    # Move data to device
+                    if isinstance(batch_data, list):
+                        for item in batch_data:
+                            if isinstance(item, dict):
+                                for key in item:
+                                    if torch.is_tensor(item[key]):
+                                        item[key] = item[key].to(device)
+                    else:
+                        batch_data = batch_data.to(device)
+                    
+                    # Get CLIP embeddings for gating
+                    images = [x["image"].to(device) for x in batch_data]
+                    clip_images = [(x - self.current_model.pixel_mean) / self.current_model.pixel_std for x in images]
+                    clip_images_resized = F.interpolate(
+                        torch.stack(clip_images), 
+                        size=self.current_model.clip_resolution, 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                    
+                    # Get CLIP embeddings for gating network
+                    with torch.no_grad():
+                        clip_features = self.current_model.sem_seg_head.predictor.clip_model.encode_image(
+                            clip_images_resized, dense=True
+                        )
+                        # Use CLS token for gating
+                        gating_embeddings = clip_features[:, 0, :]  # [batch_size, 768]
+                    
+                    # Get gating weights
+                    gating_weights = self.observer.gating_network(gating_embeddings)
+                    gating_probs = F.softmax(gating_weights, dim=-1)
+                    
+                    # Forward pass through model
+                    loss_dict = self.current_model(batch_data)
+                    losses = sum(loss_dict.values())
+                    
+                    # Weight the loss by gating probabilities
+                    # For this domain, we want to maximize the corresponding gating weight
+                    domain_weight = gating_probs[:, domain_idx].mean()
+                    weighted_loss = losses * domain_weight
+                    
+                    # Backward pass
+                    optimizer.zero_grad()
+                    weighted_loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += weighted_loss.item()
+                
+                # Validation
+                self.current_model.eval()
+                self.observer.gating_network.eval()
+                val_loss = 0.0
+                
+                with torch.no_grad():
+                    for batch_data in val_loader:
+                        # Move data to device
+                        if isinstance(batch_data, list):
+                            for item in batch_data:
+                                if isinstance(item, dict):
+                                    for key in item:
+                                        if torch.is_tensor(item[key]):
+                                            item[key] = item[key].to(device)
+                        else:
+                            batch_data = batch_data.to(device)
+                        
+                        # Get CLIP embeddings for gating
+                        images = [x["image"].to(device) for x in batch_data]
+                        clip_images = [(x - self.current_model.pixel_mean) / self.current_model.pixel_std for x in images]
+                        clip_images_resized = F.interpolate(
+                            torch.stack(clip_images), 
+                            size=self.current_model.clip_resolution, 
+                            mode='bilinear', 
+                            align_corners=False
+                        )
+                        
+                        # Get CLIP embeddings for gating network
+                        clip_features = self.current_model.sem_seg_head.predictor.clip_model.encode_image(
+                            clip_images_resized, dense=True
+                        )
+                        gating_embeddings = clip_features[:, 0, :]
+                        
+                        # Get gating weights
+                        gating_weights = self.observer.gating_network(gating_embeddings)
+                        gating_probs = F.softmax(gating_weights, dim=-1)
+                        
+                        # Forward pass through model
+                        loss_dict = self.current_model(batch_data)
+                        losses = sum(loss_dict.values())
+                        
+                        # Weight the loss by gating probabilities
+                        domain_weight = gating_probs[:, domain_idx].mean()
+                        weighted_loss = losses * domain_weight
+                        
+                        val_loss += weighted_loss.item()
+                
+                # Calculate average losses
+                train_loss /= len(train_loader)
+                val_loss /= len(val_loader)
+                
+                # Log results
+                print(f"Domain {domain.name} - Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                
+                # Log to files
+                with open(log_file, 'a') as f:
+                    f.write(f"Domain {domain.name} - Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}\n")
+                
+                with open(csv_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([domain.name, epoch + 1, train_loss, val_loss])
+                
+                # Early stopping
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"Early stopping for domain {domain.name} at epoch {epoch+1}")
+                        break
+            
+            print(f"Completed training on domain: {domain.name}")
+        
+        print("MoE gating network with LoRA adapters training completed!")
+        print(f"Training logs saved to: {log_dir}")
+
+    def _initialize_model_with_adapters(self, domains: list[Domain]) -> None:
+        """
+        Initialize the model with all LoRA adapters loaded.
+        """
+        # Load the base model with the first domain's configuration
+        first_domain = domains[0]
+        self.current_model = load_catseg_model(first_domain.args)
+        
+        # Load all LoRA adapters
+        for domain in domains:
+            lora_path = domain.lora_path
+            if lora_path and lora_path.exists():
+                print(f"Loading LoRA adapter: {lora_path}")
+                if hasattr(self.current_model, 'load_adapter'):
+                    self.current_model.load_adapter(lora_path, domain.name)
+                else:
+                    # If not a PEFT model, wrap it
+                    self.current_model = peft.PeftModel.from_pretrained(
+                        self.current_model, lora_path, domain.name
+                    )
 
 
 class DomainOrchestrator:
@@ -138,6 +640,66 @@ class DomainOrchestrator:
         self._setup_observer()
 
 
+    def train_moe_gating_network(
+        self,
+        source_domains: list[str] = None,
+        epochs: int = 100,
+        learning_rate: float = 0.001,
+        batch_size: int = 32,
+        validation_split: float = 0.2,
+        hidden_dim: int = 512
+    ) -> None:
+        """
+        Train the MoE gating network using the specified source domains.
+        """
+        if source_domains is None:
+            source_domains = list(self._source_domains.keys())
+        
+        # Get domain objects
+        domains = [self._source_domains[name] for name in source_domains]
+        
+        # Train the gating network
+        self.observer.train_gating_network(
+            domains=domains,
+            embedding_manager=self.embedding_manager,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            validation_split=validation_split,
+            hidden_dim=hidden_dim
+        )
+
+
+    def train_mixture_of_experts_with_adapters(
+        self,
+        source_domains: list[str],
+        epochs: int = 100,
+        learning_rate: float = 0.001,
+        batch_size: int = 8,
+        validation_split: float = 0.2,
+        hidden_dim: int = 512,
+        log_dir: str = "./moe_training_logs"
+    ) -> None:
+        """
+        Train the MoE gating network jointly with all LoRA adapters using segmentation loss.
+        """
+        
+        # Get domain objects
+        # domains = [self._source_domains[name] for name in source_domains]
+        # print(f"source domains are {source_domains}")
+        # print(f"source domains2 are {self._source_domains}")
+        
+        # Train the gating network with adapters
+        self.observer.train_moe_with_adapters(
+            source_domains=source_domains,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            validation_split=validation_split,
+            hidden_dim=hidden_dim,
+            log_dir=log_dir
+        )
+
     def _benchmark_on_current_target_domain(self, name: str, target_domain: Domain) -> Any:
         print(
             f"Benchmarking {name} on the domain {target_domain.name} ...\n"
@@ -176,6 +738,7 @@ class DomainOrchestrator:
         """
         Load the LoRA adapter for the specified domain.
         """
+        # print(f"all the args are: {target_domain}, {source_domain}, {lora_path}")
         if self.current_model is None:
             # Wrap the model in PeftModel class the first time an adapter is loaded
             # The base model should be loaded with target domain config to avoid label space mismatch
@@ -308,7 +871,7 @@ class DomainOrchestrator:
         remove_target_adapter: bool,
         mode: Literal["uniform", "centroid"],
         target_embedding=None,
-        softmax_temperature: int | None = 0.05,
+        softmax_temperature: Optional[int] = 0.05,
         top_k: int = 5,  # number of domains to merge
         combination_type: str = "cat",
         similarity_measure: Callable[
@@ -518,7 +1081,7 @@ class DomainOrchestrator:
         self,
         target_domains: list[str],
         remove_target_adapter: bool = False,
-        softmax_temperature: int | None = 0.05,
+        softmax_temperature: Optional[int] = 0.05,
         top_k: int = 5,  # number of domains to merge
         combination_type: str = "cat",
         similarity_measure: Callable[
@@ -609,3 +1172,167 @@ class DomainOrchestrator:
         print(f"Experiment took {total} seconds to complete!")
 
         return results, weights
+
+    def benchmark_semla_moe(
+        self,
+        target_domains: list[str],
+        remove_target_adapter: bool = False,
+        top_k: int = 5,
+        combination_type: str = "cat",
+        log_dir: str = "./moe_weight_distribution"
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """
+        Benchmark using MoE gating network for adapter selection.
+        """
+        from detectron2.evaluation import inference_context, SemSegEvaluator
+        from contextlib import ExitStack
+
+        results = {}
+        weights = {}
+
+        # Create log directory
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Create a single log file for all images
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file_path = os.path.join(log_dir, f"moe_weight_distribution_{timestamp}.csv")
+        
+        # Initialize CSV logging
+        with open(log_file_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['filename', 'domain_rank', 'domain_name', 'weight', 'k_values'])
+        
+        t0 = time.time()
+
+        for current_target_domain_name in target_domains:
+            
+            current_target_domain = self._target_domains[current_target_domain_name]
+
+            self._set_current_target_domain(
+                current_target_domain,
+            )
+
+            data_loader = current_target_domain.data_loader
+            evaluator = current_target_domain.evaluator
+
+            model = self.current_model
+
+            evaluator.reset()
+
+            with ExitStack() as stack:
+                if isinstance(model, nn.Module):
+                    stack.enter_context(inference_context(model))
+                stack.enter_context(torch.no_grad())
+
+                # Open the log file for this target domain
+                with open(log_file_path, 'a', newline='') as log_file:
+                    for _, inputs in enumerate(data_loader):
+
+                        input_path = inputs[0]["file_name"]
+                        filename = os.path.basename(input_path)  # Extract just the filename
+
+                        print(f"Predicting image: {input_path}")
+
+                        current_embedding = self.embedding_manager.embed_image(input_path)
+
+                        weight_dict, merged_adpater_name = self._merge_moe(
+                            target_domain=current_target_domain,
+                            remove_target_adapter=remove_target_adapter,
+                            target_embedding=current_embedding,
+                            top_k=top_k,
+                            combination_type=combination_type,
+                            filename=filename,
+                            log_file_handle=log_file
+                        )
+
+                        for domain, weight in weight_dict.items():
+                            weights.setdefault(domain, []).append(weight)
+
+                        model = self.current_model
+
+                        outputs = model(inputs)
+
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                        if isinstance(evaluator, SemSegEvaluator):
+                            _ = evaluator.process(inputs, outputs)
+                        else:
+                            _ = evaluator.process_image(inputs, outputs)
+
+                        self.current_model.delete_adapter(merged_adpater_name)
+
+            print(f"Benchmarking on domain '{current_target_domain.name}' ...")
+            result_dict = evaluator.evaluate()
+            result = self._get_result_from_dict(result_dict)
+            print(f"Result for domain '{current_target_domain.name}': {result}\n")
+
+            results.update({current_target_domain.name: result})
+
+            if not isinstance(evaluator, SemSegEvaluator):
+                evaluator._working_dir.cleanup()
+
+        total = time.time() - t0
+        print(f"SemLA MoE Experiment took {total} seconds to complete!")
+        print(f"Weight distribution logs saved to: {log_file_path}")
+
+        return results, weights
+
+    def _merge_moe(
+        self,
+        target_domain: Domain,
+        remove_target_adapter: bool,
+        target_embedding: npt.NDArray,
+        top_k: int = 5,
+        combination_type: str = "cat",
+        filename: str = None,
+        log_file_handle = None
+    ) -> tuple[dict[str, float], str]:
+        """
+        Merge adapters using MoE gating network.
+        """
+        source_domains = None
+        if remove_target_adapter:
+            print(f"Removing {target_domain.name} from source domains!")
+            source_domains = [
+                domain
+                for _, domain in self._source_domains.items() if domain.name != target_domain.name
+            ]
+        else:
+            source_domains = [
+                domain
+                for _, domain in self._source_domains.items()
+            ]
+
+        # Use MoE gating network to get domain weights with logging
+        domain_weight_mapping = self.observer.calculate_moe_similarity_to_domains(
+            embedding=target_embedding,
+            domains=source_domains,
+            top_k=top_k,
+            filename=filename,
+            log_file_handle=log_file_handle
+        )
+
+        # Get the selected domains and their weights
+        selected_domains = list(domain_weight_mapping.keys())
+        weights = list(domain_weight_mapping.values())
+
+        print(f"MoE selected domains: {selected_domains}")
+        print(f"MoE weights: {weights}")
+
+        merged_name = ""
+        for n, w in domain_weight_mapping.items():
+            merged_name += f"_{n}_{str(w).replace('.','_')}"
+        merged_name += f"_{combination_type}_{target_domain.name}"
+
+        self._merge_adapters(
+            merge_domains=selected_domains,
+            weights=weights,
+            merged_name=merged_name,
+            combination_type=combination_type
+        )
+
+        print(f"Setting {merged_name} as the active adapter.\n")
+        self.current_model.set_adapter(merged_name)
+
+        return domain_weight_mapping, merged_name
