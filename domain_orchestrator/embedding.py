@@ -86,6 +86,43 @@ class EmbeddingManager:
         print("Finished embedding dataset.")
         return dataset_embeddings
         
+    def embed_images_batch(self, image_paths: list[str], batch_size: int = 128) -> npt.NDArray:
+        """Embed multiple images in batches for efficiency."""
+        all_embeddings = []
+        
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            batch_images = []
+            
+            # Load all images in the batch
+            for image_path in batch_paths:
+                try:
+                    image = Image.open(image_path).convert("RGB")
+                    batch_images.append(image)
+                except FileNotFoundError:
+                    print(f"Error: Image file '{image_path}' not found.")
+                    raise
+                except Exception as e:
+                    print(f"Error opening image '{image_path}': {e}")
+                    raise
+            
+            # Process batch through CLIP
+            if self.embedding_model.embedding_processor is None or self.embedding_model.embedding_model is None:
+                print("Error: CLIP model or processor is not initialized.")
+                raise
+            
+            inputs = self.embedding_model.embedding_processor(images=batch_images, return_tensors="pt").to("cuda")
+            
+            # Generate embeddings for the batch
+            with torch.no_grad():
+                batch_embeddings = (
+                    self.embedding_model.embedding_model.get_image_features(**inputs).detach().cpu().numpy()
+                )
+            
+            all_embeddings.append(batch_embeddings)
+        
+        return np.vstack(all_embeddings)
+
     def calculate_statistics(self, domain_name, domain_path, train_path):
 
         """

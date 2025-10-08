@@ -81,7 +81,7 @@ class MoEGatingNetwork(nn.Module):
         """Forward pass through the gating network."""
         return self.network(x)
     
-    def get_top_k_weights(self, x: torch.Tensor, top_k: int, temperature: float = 2) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_top_k_weights(self, x: torch.Tensor, top_k: int, temperature: float = 4) -> tuple[torch.Tensor, torch.Tensor]:
         """Get top-k domain weights and indices."""
         # 1.5 (17.93), 10(18.24), 5(18.29), 4(18.30), 3(18.27), 2(18.11)
         logits = self.forward(x)
@@ -206,7 +206,8 @@ class DomainObserver:
         batch_size: int = 32,
         validation_split: float = 0.2,
         hidden_dim: int = 512,
-        log_dir: str = "./moe_training_logs"
+        log_dir: str = "./moe_training_logs",
+        embedding_batch_size: int = 1024  # New parameter for embedding batch size
     ) -> None:
         """
         Train the MoE gating network using data from all source domains.
@@ -237,21 +238,29 @@ class DomainObserver:
             # Get training data loader
             data_loader = domain.data_loader
             
-            domain_embeddings = []
+            # Collect all image paths first
+            image_paths = []
             for inputs in data_loader:
                 input_path = inputs[0]["file_name"]
-                embedding = embedding_manager.embed_image(input_path)
-                domain_embeddings.append(embedding)
+                image_paths.append(input_path)
+            
+            # Process all images in batches for efficiency
+            time_start = time.time()
+            # can this be further optimized so that multiple GPUs are used for multple domains?
+            domain_embeddings = embedding_manager.embed_images_batch(image_paths, batch_size=embedding_batch_size)
+            time_end = time.time()
+            print(f"time taken to embed the domain {domain.name} is {time_end - time_start} seconds")
             
             # Convert to numpy arrays
-            domain_embeddings = np.array(domain_embeddings)
             domain_labels = np.full(len(domain_embeddings), self.domain_to_index[domain.name])
             
             all_embeddings.append(domain_embeddings)
             all_labels.append(domain_labels)
         
         # Concatenate all data
-        X = np.vstack(all_embeddings).squeeze(1) # remove first dimension (=1)
+        print(f"shape of all_embeddings are {all_embeddings[0].shape}")
+        X = np.vstack(all_embeddings) # remove first dimension (=1)
+        print(f"shape of X are {X.shape}")
         y = np.concatenate(all_labels)
         print(f"shape of X and y are {X.shape} and {y.shape}")
         
@@ -298,9 +307,21 @@ class DomainObserver:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device)
                 
                 optimizer.zero_grad()
-                print(f"input shape is {batch_X.shape}")
+                #print(f"input shape is {batch_X.shape}")
                 outputs = self.gating_network(batch_X)
+                # TODO: try different ways of adding noise
+                #noise = torch.randn_like(outputs) * 1
+                #outputs = outputs + noise
+                
+                #print(f"shape of outputs are {outputs.shape}")
+                probs = F.softmax(outputs, dim=-1)
+                entropy_loss = -1*torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
+                #print(f"shape of probs are {probs.shape}")
+                #print(f"probs are {probs}")
+
                 loss = criterion(outputs, batch_y)
+                print(f"entropy loss is {entropy_loss} and loss is {loss}")
+                loss += 0 * entropy_loss
                 loss.backward()
                 optimizer.step()
                 
