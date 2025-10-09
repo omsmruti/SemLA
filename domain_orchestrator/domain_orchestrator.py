@@ -9,6 +9,8 @@ import os
 import csv
 import json
 from datetime import datetime
+import concurrent.futures
+from functools import partial
 
 import numpy as np
 import numpy.typing as npt
@@ -24,6 +26,7 @@ from sklearn.model_selection import train_test_split
 import peft
 
 from .embedding import EmbeddingManager
+
 
 logging.disable()
 
@@ -207,7 +210,10 @@ class DomainObserver:
         validation_split: float = 0.2,
         hidden_dim: int = 512,
         log_dir: str = "./moe_training_logs",
-        embedding_batch_size: int = 1024  # New parameter for embedding batch size
+        embedding_batch_size: int = 1024,
+        cache_dir: str = "./embedding_cache",
+        path_cache_dir: str = "./path_cache",  # New parameter for path cache
+        force_refresh_paths: bool = False  # New parameter to force refresh paths
     ) -> None:
         """
         Train the MoE gating network using data from all source domains.
@@ -215,6 +221,8 @@ class DomainObserver:
         print("Training MoE gating network...")
 
         os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(path_cache_dir, exist_ok=True)  # Create path cache directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = os.path.join(log_dir, f"training_log_{timestamp}.txt")
         # csv_file = os.path.join(log_dir, f"training_metrics_{timestamp}.csv")
@@ -238,16 +246,27 @@ class DomainObserver:
             # Get training data loader
             data_loader = domain.data_loader
             
-            # Collect all image paths first
-            image_paths = []
-            for inputs in data_loader:
-                input_path = inputs[0]["file_name"]
-                image_paths.append(input_path)
+            # Get image paths using caching
+            image_paths = embedding_manager.get_cached_image_paths(
+                domain_name=domain.name,
+                data_loader=data_loader,
+                cache_dir=path_cache_dir,
+                force_refresh=force_refresh_paths
+            )
             
-            # Process all images in batches for efficiency
+            if not image_paths:
+                print(f"Warning: No image paths found for domain {domain.name}, skipping...")
+                continue
+            
+            # Process all images in batches with caching
             time_start = time.time()
             # can this be further optimized so that multiple GPUs are used for multple domains?
-            domain_embeddings = embedding_manager.embed_images_batch(image_paths, batch_size=embedding_batch_size)
+            domain_embeddings = embedding_manager.embed_images_batch_with_cache(
+                domain_name=domain.name,
+                image_paths=image_paths, 
+                batch_size=embedding_batch_size,
+                cache_dir=cache_dir
+            )
             time_end = time.time()
             print(f"time taken to embed the domain {domain.name} is {time_end - time_start} seconds")
             
@@ -668,7 +687,11 @@ class DomainOrchestrator:
         learning_rate: float = 0.001,
         batch_size: int = 32,
         validation_split: float = 0.2,
-        hidden_dim: int = 512
+        hidden_dim: int = 512,
+        embedding_batch_size: int = 1024,
+        cache_dir: str = "./embedding_cache",
+        path_cache_dir: str = "./path_cache",  # New parameter
+        force_refresh_paths: bool = False  # New parameter
     ) -> None:
         """
         Train the MoE gating network using the specified source domains.
@@ -687,7 +710,11 @@ class DomainOrchestrator:
             learning_rate=learning_rate,
             batch_size=batch_size,
             validation_split=validation_split,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            embedding_batch_size=embedding_batch_size,
+            cache_dir=cache_dir,
+            path_cache_dir=path_cache_dir,
+            force_refresh_paths=force_refresh_paths
         )
 
 
@@ -1357,3 +1384,233 @@ class DomainOrchestrator:
         self.current_model.set_adapter(merged_name)
 
         return domain_weight_mapping, merged_name
+
+    def benchmark_magic_weights(
+        self,
+        target_domains: list[str],
+        weight_combinations: list[dict[str, float]],
+        remove_target_adapter: bool = False,
+        combination_type: str = "cat"
+    ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+        """
+        Benchmark using magic weights - try all weight combinations per image and select best.
+        """
+        from detectron2.evaluation import inference_context, SemSegEvaluator
+        from contextlib import ExitStack
+
+        results = {}
+        best_weights_per_image = {}
+
+        t0 = time.time()
+
+        for current_target_domain_name in target_domains:
+            
+            current_target_domain = self._target_domains[current_target_domain_name]
+
+            self._set_current_target_domain(
+                current_target_domain,
+            )
+
+            data_loader = current_target_domain.data_loader
+            evaluator = current_target_domain.evaluator
+
+            model = self.current_model
+
+            evaluator.reset()
+
+            domain_name, split = current_target_domain.name, "val"
+            registered_dataset_name = f"{domain_name}_sem_seg_{split}"
+            if domain_name == "coco-stuff-base":
+                registered_dataset_name = f"coco_2017_{split}_stuff_all_sem_seg"
+            elif domain_name == "indraeye-rgb-base" or domain_name == "indraeye-rgb":
+                registered_dataset_name = f"IE_Segmentation_rgb_sem_seg_{split}"
+            elif domain_name == "msrs-rgb-base":
+                registered_dataset_name = f"msrs_rgb_sem_seg_{split}"
+            elif domain_name == "msrs-ir-base":
+                registered_dataset_name = f"msrs_ir_sem_seg_{split}"
+            elif domain_name == "indraeye-ir-base":
+                registered_dataset_name = f"IE_Segmentation_sem_seg_{split}"
+            elif domain_name == "cart-ir-base":
+                registered_dataset_name = f"cart_ir_sem_seg_{split}"
+            elif domain_name == "cart-rgb-base":
+                registered_dataset_name = f"cart_rgb_sem_seg_{split}"
+            
+            from catseg.train_net import Trainer, setup
+            temp_evaluator = Trainer.build_evaluator(setup(current_target_domain.args), registered_dataset_name)
+            temp_evaluator.reset()
+
+            with ExitStack() as stack:
+                if isinstance(model, nn.Module):
+                    stack.enter_context(inference_context(model))
+                stack.enter_context(torch.no_grad())
+
+                from tqdm import tqdm
+
+                # Wrap the data_loader loop in tqdm for progress bar
+                for _, inputs in tqdm(enumerate(data_loader), total=len(data_loader), desc="Images"):
+
+                    input_path = inputs[0]["file_name"]
+                    filename = os.path.basename(input_path)
+
+                    print(f"Testing magic weights on image: {input_path}")
+
+                    # Try all weight combinations and find the best one for this image
+                    best_miou = -1
+                    best_weight_combination = None
+
+                    for i, weight_combination in enumerate(weight_combinations):
+                        print(f"  Trying combination {i+1}/{len(weight_combinations)}: {weight_combination}")
+                        
+                        # Create merged adapter with this weight combination
+                        weight_dict, merged_adapter_name = self._merge_magic_weights(
+                            target_domain=current_target_domain,
+                            remove_target_adapter=remove_target_adapter,
+                            weight_combination=weight_combination,
+                            combination_type=combination_type
+                        )
+
+                        # Evaluate this combination on this single image
+                        model = self.current_model
+                        outputs = model(inputs)
+
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                        # Calculate mIoU for this single image
+                        miou = self._evaluate_single_image_miou(inputs, outputs, temp_evaluator)
+                        
+                        print(f"mIoU: {miou}")
+
+                        if miou > best_miou:
+                            best_miou = miou
+                            best_weight_combination = weight_combination
+                        
+                        # Clean up this adapter before trying the next one
+                        self.current_model.delete_adapter(merged_adapter_name)
+
+                    # Use the best combination for final evaluation
+                    print(f"Best combination for {filename}: {best_weight_combination} (mIoU: {best_miou})")
+                    
+                    # Store the best weights for this image
+                    best_weights_per_image[filename] = best_weight_combination
+
+                    # Recreate the best adapter for final evaluation
+                    weight_dict, merged_adapter_name = self._merge_magic_weights(
+                        target_domain=current_target_domain,
+                        remove_target_adapter=remove_target_adapter,
+                        weight_combination=best_weight_combination,
+                        combination_type=combination_type
+                    )
+
+                    # Final evaluation with best weights
+                    model = self.current_model
+                    outputs = model(inputs)
+
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
+                    if isinstance(evaluator, SemSegEvaluator):
+                        _ = evaluator.process(inputs, outputs)
+                    else:
+                        _ = evaluator.process_image(inputs, outputs)
+
+                    self.current_model.delete_adapter(merged_adapter_name)
+
+            print(f"Benchmarking on domain '{current_target_domain.name}' ...")
+            result_dict = evaluator.evaluate()
+            result = self._get_result_from_dict(result_dict)
+            print(f"Result for domain '{current_target_domain.name}': {result}\n")
+
+            results.update({current_target_domain.name: result})
+
+            if not isinstance(evaluator, SemSegEvaluator):
+                evaluator._working_dir.cleanup()
+
+        total = time.time() - t0
+        print(f"Magic weights experiment took {total} seconds to complete!")
+
+        return results, best_weights_per_image
+
+    def _merge_magic_weights(
+        self,
+        target_domain: Domain,
+        remove_target_adapter: bool,
+        weight_combination: dict[str, float],
+        combination_type: str = "cat"
+    ) -> tuple[dict[str, float], str]:
+        """
+        Merge adapters using the specified weight combination.
+        """
+        source_domains = None
+        if remove_target_adapter:
+            print(f"Removing {target_domain.name} from source domains!")
+            source_domains = [
+                domain
+                for _, domain in self._source_domains.items() if domain.name != target_domain.name
+            ]
+        else:
+            source_domains = [
+                domain
+                for _, domain in self._source_domains.items()
+            ]
+
+        # Use the provided weight combination
+        domain_weight_mapping = weight_combination.copy()
+        
+        # Ensure all source domains are included (with 0 weight if not specified)
+        for domain in source_domains:
+            if domain.name not in domain_weight_mapping:
+                domain_weight_mapping[domain.name] = 0.0
+
+        # Filter out domains with 0 weight
+        active_domains = {k: v for k, v in domain_weight_mapping.items() if v > 0}
+        active_domain_names = list(active_domains.keys())
+        active_weights = list(active_domains.values())
+
+        # Normalize weights to sum to 1
+        total_weight = sum(active_weights)
+        if total_weight > 0:
+            active_weights = [w / total_weight for w in active_weights]
+            active_domains = dict(zip(active_domain_names, active_weights))
+
+        merged_name = ""
+        for n, w in active_domains.items():
+            merged_name += f"_{n}_{str(w).replace('.','_')}"
+        merged_name += f"_{combination_type}_{target_domain.name}"
+
+        self._merge_adapters(
+            merge_domains=active_domain_names,
+            weights=active_weights,
+            merged_name=merged_name,
+            combination_type=combination_type
+        )
+
+        print(f"Setting {merged_name} as the active adapter.\n")
+        self.current_model.set_adapter(merged_name)
+
+        return active_domains, merged_name
+
+
+    def _evaluate_single_image_miou(self, inputs, outputs, temp_evaluator):
+        """
+        Evaluate mIoU for a single image prediction using a separate evaluator instance.
+        """
+        # Reset the temporary evaluator
+        temp_evaluator.reset()
+        
+        # Process the single image
+        if hasattr(temp_evaluator, 'process_image'):
+            temp_evaluator.process_image(inputs, outputs)
+        else:
+            # For SemSegEvaluator, we need to use process method
+            temp_evaluator.process(inputs, outputs)
+        
+        # Get the evaluation results
+        result_dict = temp_evaluator.evaluate()
+        
+        # Extract mIoU from the results
+        miou = result_dict.get("sem_seg", {}).get("IoU", None)
+        if miou is None:
+            miou = result_dict.get("sem_seg", {}).get("mIoU", 0.0)
+        
+        return miou
