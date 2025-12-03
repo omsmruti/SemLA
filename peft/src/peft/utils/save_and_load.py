@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from ast import Pass
 import os
 import platform
 import re
@@ -88,7 +89,7 @@ def get_peft_model_state_dict(
         # to be used directly with the state dict which is necessary when using DeepSpeed or FSDP
         bias = config.bias
         if bias == "none":
-            to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}
+            to_return = {k: state_dict[k] for k in state_dict if "lora_" in k or "conv" in k}
         elif bias == "all":
             to_return = {k: state_dict[k] for k in state_dict if "lora_" in k or "bias" in k}
         elif bias == "lora_only":
@@ -101,7 +102,7 @@ def get_peft_model_state_dict(
                         to_return[bias_name] = state_dict[bias_name]
         else:
             raise NotImplementedError
-        to_return = {k: v for k, v in to_return.items() if (("lora_" in k and adapter_name in k) or ("bias" in k))}
+        to_return = {k: v for k, v in to_return.items() if (((("lora_" in k or "conv" in k) and adapter_name in k) or ("bias" in k)))}
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
@@ -347,21 +348,31 @@ def _find_mismatched_keys(
 
     return peft_model_state_dict, mismatched
 
-
+# TODO: change to add conv layer names
 def _insert_adapter_name_into_state_dict(
     state_dict: dict[str, torch.Tensor], adapter_name: str, parameter_prefix: str
 ) -> dict[str, torch.Tensor]:
     """Utility function to remap the state_dict keys to fit the PEFT model by inserting the adapter name."""
     peft_model_state_dict = {}
     for key, val in state_dict.items():
-        if parameter_prefix in key:
-            suffix = key.split(parameter_prefix)[1]
-            if "." in suffix:
-                suffix_to_replace = ".".join(suffix.split(".")[1:])
-                key = key.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+        if parameter_prefix in key or "conv1" in key:
+            if "conv1" in key:
+                suffix = key.split("conv1")[1]
+                if "." in suffix:
+                    suffix_to_replace = ".".join(suffix.split(".")[1:])
+                    key = key.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+                else:
+                    key = f"{key}.{adapter_name}"
+                peft_model_state_dict[key] = val
+
             else:
-                key = f"{key}.{adapter_name}"
-            peft_model_state_dict[key] = val
+                suffix = key.split(parameter_prefix)[1]
+                if "." in suffix:
+                    suffix_to_replace = ".".join(suffix.split(".")[1:])
+                    key = key.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+                else:
+                    key = f"{key}.{adapter_name}"
+                peft_model_state_dict[key] = val
         else:
             peft_model_state_dict[key] = val
     return peft_model_state_dict
@@ -393,6 +404,15 @@ def set_peft_model_state_dict(
     """
     config = model.peft_config[adapter_name]
     state_dict = peft_model_state_dict
+    state_dict_keys = list(state_dict.keys())
+    for key in state_dict_keys:
+        if "conv" in key:
+            #print("key----", key)
+            pass
+        elif "lora" in key:
+            pass
+    #print("stopping here")
+    #import time; time.sleep(10000)
 
     # handle auxiliary training wrappers such as ModulesToSaveWrapper and TrainableTokensWrapper by getting each of
     # them and translating saved state dict key (which does not include the adapter name) to loaded state dict key
