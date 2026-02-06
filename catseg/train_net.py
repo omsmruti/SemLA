@@ -782,7 +782,7 @@ class Trainer(DefaultTrainer):
         params: List[Dict[str, Any]] = []
         memo: Set[torch.nn.parameter.Parameter] = set()
         # import ipdb;
-        # ipdb.set_trace(context=10)
+        # ipdb.set_trace()
         for module_name, module in model.named_modules():
             for module_param_name, value in module.named_parameters(recurse=False):
                 if not value.requires_grad:
@@ -861,20 +861,55 @@ class Trainer(DefaultTrainer):
         return res
 
 
+
 def add_lora(cfg, model):
     logger = logging.getLogger("detectron2.trainer")
-    config = peft.LoraConfig(
-        r=cfg.MODEL.LORA.RANK,
-        lora_alpha=cfg.MODEL.LORA.ALPHA,
-        lora_dropout=cfg.MODEL.LORA.DROPOUT,
-        target_modules=cfg.MODEL.LORA.MODUELS,
-        bias=cfg.MODEL.LORA.BIAS,
-        use_rslora=cfg.MODEL.LORA.USE_RSLORA,
-        use_dora=cfg.MODEL.LORA.USE_DORA,
-    )
+    
+    # Check if Conv-LoRA is enabled
+    use_conv_lora = getattr(cfg.MODEL.LORA, 'USE_CONV_LORA', False)
+    
+    # Build LoRA config with optional Conv-LoRA parameters
+    config_kwargs = {
+        'r': cfg.MODEL.LORA.RANK,
+        'lora_alpha': cfg.MODEL.LORA.ALPHA,
+        'lora_dropout': cfg.MODEL.LORA.DROPOUT,
+        'target_modules': cfg.MODEL.LORA.MODUELS,
+        'bias': cfg.MODEL.LORA.BIAS,
+        'use_rslora': cfg.MODEL.LORA.USE_RSLORA,
+    }
+    
+    if use_conv_lora:
+        # Conv-LoRA configuration
+        config_kwargs['use_dora'] = False  # Conv-LoRA is separate from DoRA
+        config_kwargs['use_conv_lora'] = True
+        config_kwargs['conv_lora_expert_num'] = getattr(cfg.MODEL.LORA, 'CONV_LORA_EXPERT_NUM', 8)
+        config_kwargs['conv_lora_topk'] = getattr(cfg.MODEL.LORA, 'CONV_LORA_TOPK', 1)
+        config_kwargs['conv_lora_noisy_gating'] = getattr(cfg.MODEL.LORA, 'CONV_LORA_NOISY_GATING', True)
+        logger.info(f"Conv-LoRA enabled with {config_kwargs['conv_lora_expert_num']} experts, topk={config_kwargs['conv_lora_topk']}")
+    else:
+        # Standard LoRA or DoRA
+        config_kwargs['use_dora'] = cfg.MODEL.LORA.USE_DORA
+    
+    config = peft.LoraConfig(**config_kwargs)
     peft_model = peft.get_peft_model(model, config, adapter_name=cfg.MODEL.LORA.NAME)
     
-    logger.info("LoRAs injected for training.")
+    if use_conv_lora:
+        logger.info("Conv-LoRAs injected for training (with MoE convolutional experts).")
+        
+        # Quick check: verify experts are trainable
+        expert_check_count = 0
+        for name, module in peft_model.named_modules():
+            if hasattr(module, 'lora_moe_experts') and cfg.MODEL.LORA.NAME in module.lora_moe_experts:
+                experts = module.lora_moe_experts[cfg.MODEL.LORA.NAME]
+                for idx, expert in enumerate(experts):
+                    expert_check_count += 1
+                    trainable_params = sum(p.numel() for p in expert.parameters() if p.requires_grad)
+                    total_params = sum(p.numel() for p in expert.parameters())
+                    status = "✓ TRAINABLE" if trainable_params > 0 else "✗ FROZEN"
+                    logger.info(f"{status} | Expert {idx} in {name}: {trainable_params}/{total_params} params trainable")
+        logger.info(f"Total experts checked: {expert_check_count}")
+    else:
+        logger.info("LoRAs injected for training.")
 
     return peft_model
 
@@ -947,13 +982,9 @@ def main(args):
         trainer.reset_trainer(cfg, peft_model)
         # Attaching LoRAs changes the modules to which hooks are set, we need to reset
         trainer.model.base_model.model.reset_forward_hooks()
-
-        # print("__----____--TRAINER MODEL-____--____-", trainer.model, '-__-----_____----')
-        # print(HEY)
-        # trainer.model.print_trainable_parameters()
+        trainer.model.print_trainable_parameters()
 
     output = trainer.train()
-    trainer.model.print_trainable_parameters()
 
     # Save only the LoRA weights to LoRA DB
     if cfg.MODEL.LORA.ENABLED == True:

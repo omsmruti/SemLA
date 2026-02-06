@@ -20,8 +20,8 @@ CLASSES = ('background(and back-hoe)',
 
 
 def register_dataset(root):
-    ds_name = 'indraeye'
-    # ds_name = 'IE_Segmentation'
+    #ds_name = 'indraeye'
+    ds_name = 'IE_Segmentation'
     # root = os.path.join(root, 'Indraeye/eo')
     root = os.path.join(root, 'indraeye/eo')
 
@@ -36,7 +36,7 @@ def register_dataset(root):
         print(image_dir)
         print(gt_dir)
         #sprint(heyy)
-        full_name = f'{ds_name}_sem_seg_{split}'  ##'indraeye_sem_seg_{split}'
+        full_name = f'indraeye_sem_seg_{split}'  ##'indraeye_sem_seg_{split}'
         DatasetCatalog.register(
             full_name,
             lambda x=image_dir, y=gt_dir: load_sem_seg(

@@ -326,7 +326,7 @@ def add_lora_config(
 
     cfg.MODEL.LORA = CN()
     cfg.MODEL.LORA.ENABLED = True
-    cfg.MODEL.LORA.DB_PATH = "loradb/"
+    cfg.MODEL.LORA.DB_PATH = "moe-conv/" # change this to loradb etc.
     cfg.MODEL.LORA.NAME = "default"
     cfg.MODEL.LORA.MODUELS = MODUELS
     cfg.MODEL.LORA.RANK = 8
@@ -335,3 +335,8 @@ def add_lora_config(
     cfg.MODEL.LORA.USE_RSLORA = False
     cfg.MODEL.LORA.USE_DORA = False
     cfg.MODEL.LORA.BIAS = "none"
+    # Conv-LoRA configuration (MoE with convolutional experts)
+    cfg.MODEL.LORA.USE_CONV_LORA = True  # Enable Conv-LoRA (disables DoRA if True)
+    cfg.MODEL.LORA.CONV_LORA_EXPERT_NUM = 8  # Number of MoE experts
+    cfg.MODEL.LORA.CONV_LORA_TOPK = 1  # Top-k expert selection
+    cfg.MODEL.LORA.CONV_LORA_NOISY_GATING = True  # Noisy gating for load balancing

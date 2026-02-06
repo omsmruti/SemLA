@@ -28,7 +28,7 @@ def register_cartr_rgb(root):
     # ds_name = 'IE_day'
     ds_name = 'cartr'
     # root = os.path.join(root, 'Indraeye/eo')
-    root = os.path.join(root, 'cart')
+    root = os.path.join(root, 'CART')
 
     for split, image_dirname, sem_seg_dirname, class_names in [
         ('train', 'train/color', 'train/annotations', CLASSES),

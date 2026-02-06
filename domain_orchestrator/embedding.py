@@ -3,7 +3,13 @@ from abc import abstractmethod
 import numpy as np
 import numpy.typing as npt
 import torch
+from torch.nn import functional as F
 from PIL import Image
+from pathlib import Path
+from detectron2.structures import ImageList
+
+# Import CATSegEmbeddingModel from embedding_catseg instead of redefining it
+from domain_orchestrator.embedding_catseg import CATSegEmbeddingModel
 
 
 #abstract class
@@ -16,7 +22,7 @@ class EmbeddingModel:
 
 
 class ClipEmbeddingModel(EmbeddingModel):
-    """Handles image and dataset embedding operations."""
+    """Handles image and dataset embedding operations using HuggingFace CLIP."""
 
     def __init__(self):
         self.embedding_model = CLIPModel.from_pretrained(
@@ -54,8 +60,20 @@ class ClipEmbeddingModel(EmbeddingModel):
 class EmbeddingManager:
     """Handles image and dataset embedding operations."""
     
-    def __init__(self, embedding_model: EmbeddingModel = ClipEmbeddingModel()):
-        self.embedding_model = embedding_model
+    def __init__(self, embedding_model: EmbeddingModel = None, catseg_model=None):
+        """
+        Args:
+            embedding_model: Optional EmbeddingModel instance. If None, will use CATSeg if catseg_model provided,
+                           otherwise HuggingFace CLIP.
+            catseg_model: Optional CATSeg model instance. If provided, will use CATSegEmbeddingModel.
+        """
+        if embedding_model is None:
+            if catseg_model is not None:
+                self.embedding_model = CATSegEmbeddingModel(catseg_model)
+            else:
+                self.embedding_model = ClipEmbeddingModel()
+        else:
+            self.embedding_model = embedding_model
     
     def embed_image(self, image_path) -> npt.NDArray:
         """Embed a single image."""
@@ -97,8 +115,13 @@ class EmbeddingManager:
         Returns:
             dict: A dictionary containing the statistics.
         """
+        # Try standard suffix first, then fall back to dense_False suffix
+        #standard_suffix = "_statistics.npz"
+        #suffix = "_statistics_dense_False.npz"
         suffix = "_statistics.npz"
+        
         statistics_path = domain_path / f"{domain_name}{suffix}"
+        
         stats_dict = {}
 
         print(f"Statistics file: {statistics_path}")
@@ -131,12 +154,14 @@ class EmbeddingManager:
             "train_average_embedding": train_average_embedding
         })
 
+        # Save with standard suffix for compatibility
+        statistics_path = domain_path / f"{domain_name}{standard_suffix}"
         try:
             np.savez(
                 statistics_path,
                 train_average_embedding=train_average_embedding,
             )
-            print(f"Statistics saved to {domain_name}{suffix}")
+            print(f"Statistics saved to {domain_name}{standard_suffix}")
         except Exception as e:
             print(f"Error saving statistics file '{statistics_path}': {e}")
             raise

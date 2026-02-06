@@ -213,10 +213,10 @@ class ResidualAttentionBlock(nn.Module):
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor, prompt=None):
-        print("-__---__-Before attention and passing to the LoRA---__----__", x.shape)
+        #print("-__---__-Before attention and passing to the LoRA---__----__", x.shape)
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        print("-__---__After MLPs probably after the LoRA feature shape....__", x.shape)
+        #print("-__---__After MLPs probably after the LoRA feature shape....__", x.shape)
         if prompt is not None:
             x = torch.cat((x[0:1, :, :], x[prompt + 1: :, :]), dim=0)
         return x

@@ -35,11 +35,11 @@ def register_dataset(root):
         #('test_irrg', 'images_detectron2/test/irrg', 'annotations_detectron2/test', CLASSES),
         #('test_irrg_official', 'images_detectron2/test/irrg', 'annotations_detectron2/test', CLASSES_OFFICIAL),
         ('train_rgb', 'train/rgb_images', 'train/labels', CLASSES),
-        ('test_rgb', 'test/rgb_images', 'test/labels', CLASSES),
+        ('val_rgb', 'test/rgb_images', 'test/labels', CLASSES),
     ]:
         image_dir = os.path.join(root, image_dirname)
         gt_dir = os.path.join(root, sem_seg_dirname)
-        full_name = f'{ds_name}_sem_seg_{split}'
+        full_name = f'{ds_name}_sem_seg_{split.split("_")[0]}'
         DatasetCatalog.register(
             full_name,
             lambda x=image_dir, y=gt_dir: load_sem_seg(

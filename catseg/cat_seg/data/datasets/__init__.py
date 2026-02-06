@@ -47,4 +47,7 @@ from . import (
     register_cart_rgb,
     register_openearth,
     register_bdd100k_conv,
+    register_uavid,
+    register_isprs_potsdam,
+    register_isaid
 )

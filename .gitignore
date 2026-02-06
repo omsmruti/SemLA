@@ -9,4 +9,15 @@ results/
 loradb_20.85_indraeye/
 loradb_run1_wrong/
 IE_Seg_pred_lora/
-
+catseg/moe-conv/
+catseg/loradb_moe_convs/
+catseg/vanilla-dora/
+visualizations/
+clip_cam/
+clip_cams_indraeye/
+clip_cam_outputs/
+*.ipynb_checkpoints*
+*DS_Store*
+autogluon/
+*ipynb
+*all_lora*

@@ -2,8 +2,8 @@ _BASE_: ../../base.yaml
 MODEL:
   SEM_SEG_HEAD:
     NUM_CLASSES: 12
-    TRAIN_CLASS_JSON: "datasets/cart_rgb.json"
-    TEST_CLASS_JSON: "datasets/cart_rgb.json"
+    TRAIN_CLASS_JSON: "datasets/cartr.json"
+    TEST_CLASS_JSON: "datasets/cartr.json"
 DATASETS:
   TRAIN: ("cartr_sem_seg_train",)
   TEST: ("cartr_sem_seg_val",)

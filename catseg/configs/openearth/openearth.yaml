@@ -2,11 +2,11 @@ _BASE_: ../base.yaml
 MODEL:
   SEM_SEG_HEAD:
     NUM_CLASSES: 9
-    TRAIN_CLASS_JSON: "datasets/openearth.json"
-    TEST_CLASS_JSON: "datasets/openearth.json"
+    TRAIN_CLASS_JSON: "datasets/openearthmap.json"
+    TEST_CLASS_JSON: "datasets/openearthmap.json"
 DATASETS:
-  TRAIN: ("openearth_sem_seg_train_rgb",)
-  TEST: ("openearth_sem_seg_test_rgb",)
+  TRAIN: ("openearth_sem_seg_train",)
+  TEST: ("openearth_sem_seg_val",)
 SOLVER:
   MAX_ITER: 20000
   CHECKPOINT_PERIOD: 20000

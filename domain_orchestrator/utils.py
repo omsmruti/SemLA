@@ -60,6 +60,9 @@ def get_domain_args(
         "mv_conv",
         "muses_conv",
         "bdd_conv",
+        "uavid",
+        "isprs",
+        "isaid"
     }
 
     CS_DOMAIN_CHECK = {"normal", "rain"}
@@ -144,7 +147,10 @@ def get_domain_args(
         "cartr": "configs/cart/rgb/cart-rgb.yaml",
         "carti": "configs/cart/ir/cart-ir.yaml",
         "IE_Segmentation_ir": "configs/indraeye/ir/indraeye-ir.yaml",
-        "openearth": "configs/openearth/openearth-ir.yaml",
+        "openearth": "configs/openearth/openearth.yaml",
+        "uavid": "configs/uavid/uavid.yaml",
+        "isprs": "configs/ISPRS_Potsdam/ISPRS_Potsdam.yaml",
+        "isaid": "configs/isaid/isaid.yaml",
     }
 
     datasets = {
@@ -193,8 +199,8 @@ def get_domain_args(
             "val": f"{DETECTRON2_DATASET_PATH}mapillary_vistas/val/images/",
         },
         "a150": {
-            "train": f"{DETECTRON2_DATASET_PATH}ADEChallengeData2016/images/training/",
-            "val": f"{DETECTRON2_DATASET_PATH}ADEChallengeData2016/images/validation/",
+            "train": f"{DETECTRON2_DATASET_PATH}ADE20k/images/training/",
+            "val": f"{DETECTRON2_DATASET_PATH}ADE20k/images/validation/",
         },
         "idd": {
             "train": f"{DETECTRON2_DATASET_PATH}IDD_Segmentation/leftImg8bit/train/",
@@ -213,8 +219,8 @@ def get_domain_args(
             "val": f"{DETECTRON2_DATASET_PATH}coconut-l/val2017",
         },
         "IE_Segmentation": {
-            "train": f"{DETECTRON2_DATASET_PATH}IE_Segmentation/IE_eo_ir_split/eo/train/",
-            "val": f"{DETECTRON2_DATASET_PATH}IE_Segmentation/IE_eo_ir_split/eo/val/",
+            "train": f"{DETECTRON2_DATASET_PATH}indraeye/eo/train/",
+            "val": f"{DETECTRON2_DATASET_PATH}indraeye/eo/test/",
         },
         "IE_Segmentation_ir": {
             "train": f"{DETECTRON2_DATASET_PATH}IE_Segmentation/IE_eo_ir_split/ir/train/",
@@ -237,16 +243,16 @@ def get_domain_args(
             "val": f"{DETECTRON2_DATASET_PATH}IE_daynight/IE_eo_ir_split/eo/rgbnight/val/",
         },
         "msrs_rgb": {
-            "train": f"{DETECTRON2_DATASET_PATH}msrs/train/vi/",
-            "val": f"{DETECTRON2_DATASET_PATH}msrs/test/vi/rgbnight/val/",
+            "train": f"{DETECTRON2_DATASET_PATH}msrs/images/train",
+            "val": f"{DETECTRON2_DATASET_PATH}msrs/images/test",
         },
         "msrs_ir": {
             "train": f"{DETECTRON2_DATASET_PATH}msrs/train/ir/",
             "val": f"{DETECTRON2_DATASET_PATH}msrs/test/ir/rgbnight/val/",
         },
         "cartr": {
-            "train": f"{DETECTRON2_DATASET_PATH}cart/train/",
-            "val": f"{DETECTRON2_DATASET_PATH}cart/val/",
+            "train": f"{DETECTRON2_DATASET_PATH}CART/train/",
+            "val": f"{DETECTRON2_DATASET_PATH}CART/val/",
         },
         "carti": {
             "train": f"{DETECTRON2_DATASET_PATH}cart/train/",
@@ -259,6 +265,18 @@ def get_domain_args(
         "idd_conv": {
             "train": f"{DETECTRON2_DATASET_PATH}IDD_Segmentation/leftImg8bit/train/",
             "val": f"{DETECTRON2_DATASET_PATH}IDD_Segmentation/leftImg8bit/val/",
+        },
+        "uavid": {
+            "train": f"{DETECTRON2_DATASET_PATH}uavid_v1.5/images_detectron2/val/",
+            "val": f"{DETECTRON2_DATASET_PATH}uavid_v1.5/images_detectron2/val/",
+        },
+        "isprs": {
+            "train": f"{DETECTRON2_DATASET_PATH}ISPRS_Potsdam/images_detectron2/test/rgb/",
+            "val": f"{DETECTRON2_DATASET_PATH}ISPRS_Potsdam/images_detectron2/test/rgb/",
+        },
+        "isaid": {
+            "train": f"{DETECTRON2_DATASET_PATH}isaid/train/images/",
+            "val": f"{DETECTRON2_DATASET_PATH}isaid/val/images/",
         },
     }
 
@@ -361,12 +379,16 @@ def get_domain_args(
         return args
     else:
         from catseg.train_net import Trainer, setup
-
+        dataset_name = f"{domain_name}_sem_seg_{split}"
+        if dataset == "IE_Segmentation":
+            dataset_name = f"indraeye_sem_seg_{split}"
+        if dataset == "isprs":
+            dataset_name = f"isprs_potsdam_sem_seg_{split}"
         data_loader = Trainer.build_test_loader(
-            setup(args), f"{domain_name}_sem_seg_{split}"
+            setup(args), dataset_name
         )
 
-        evaluator = Trainer.build_evaluator(setup(args), f"{domain_name}_sem_seg_{split}")
+        evaluator = Trainer.build_evaluator(setup(args), dataset_name)
 
         return args, evaluator, data_loader
 

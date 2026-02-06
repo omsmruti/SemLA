@@ -4,7 +4,7 @@ config=$1
 gpus=$2
 output=$3
 
-export DETECTRON2_DATASETS="/datasets"
+export DETECTRON2_DATASETS="/home/datasets_all/"
 
 
 if [ -z $config ]

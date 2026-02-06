@@ -1,0 +1,9 @@
+_BASE_: ../base.yaml
+MODEL:
+  SEM_SEG_HEAD:
+    TRAIN_CLASS_JSON: "datasets/isaid.json"
+    TEST_CLASS_JSON: "datasets/isaid.json"
+    NUM_CLASSES: 16
+DATASETS:
+  TRAIN: ("isaid_sem_seg_train",)
+  TEST: ("isaid_sem_seg_val",)

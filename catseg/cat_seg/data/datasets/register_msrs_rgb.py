@@ -21,9 +21,9 @@ def register_dataset(root):
     root = os.path.join(root, 'msrs')
 
     for split, image_dirname, sem_seg_dirname, class_names in [
-        ('train', 'train/vi', 'train/labels', CLASSES),
+        ('train', 'images/train', 'annotations/train', CLASSES),
         #('val', 'images_detectron2/val', 'annotations_detectron2/val', CLASSES),
-        ('val', 'test/vi', 'test/labels', CLASSES),  #rgb
+        ('val', 'images/test', 'annotations/test', CLASSES),  #rgb
         #('test', 'ir/test', 'annotations_detectron2/test', CLASSES),  #ir
     ]:
         image_dir = os.path.join(root, image_dirname)

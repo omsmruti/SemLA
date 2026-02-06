@@ -20,6 +20,45 @@ from detectron2.utils.memory import _ignore_torch_cuda_oom
 
 from einops import rearrange
 
+# Conv-LoRA MoE loss collection
+from peft.tuners.lora import Linear as LoraLinear
+
+
+def collect_conv_lora_moe_loss(model: nn.Module) -> torch.Tensor:
+    """
+    Collect and sum MoE losses from all LoRA Linear layers with Conv-LoRA enabled.
+    
+    This function is called after forward pass to collect the load balancing losses
+    from all Conv-LoRA layers, which should be added to the main task loss.
+    
+    Args:
+        model: The model containing LoRA Linear layers with Conv-LoRA.
+        
+    Returns:
+        Total MoE loss summed across all Conv-LoRA enabled layers.
+    """
+    total_loss = None
+    device = None
+    dtype = None
+    
+    for module in model.modules():
+        if isinstance(module, LoraLinear):
+            moe_loss = getattr(module, '_moe_loss', None)
+            if moe_loss is not None and moe_loss.item() != 0.0:
+                if device is None:
+                    device = moe_loss.device
+                    dtype = moe_loss.dtype
+                if total_loss is None:
+                    total_loss = moe_loss
+                else:
+                    total_loss = total_loss + moe_loss
+    
+    if total_loss is None:
+        # No Conv-LoRA layers found or no MoE loss (Conv-LoRA not enabled)
+        return torch.tensor(0.0, device=device if device else "cuda", dtype=dtype if dtype else torch.float32)
+    
+    return total_loss
+
 @META_ARCH_REGISTRY.register()
 class CATSeg(nn.Module):
     @configurable
@@ -265,8 +304,51 @@ class CATSeg(nn.Module):
             #     print(HEY)
 
             loss = F.binary_cross_entropy_with_logits(outputs, _targets)
-            # print("_------____---____---_", loss, "*888****888****888*****")
+            
+            # Register hook to check gradients after backward
+            def check_grads_hook(grad):
+                print("\n" + "="*80)
+                print("Checking sem_seg_head parameters for None/NaN gradients:")
+                print("="*80)
+                
+                none_params = []
+                nan_params = []
+                
+                for name, param in self.sem_seg_head.named_parameters():
+                    if param.requires_grad:
+                        if param.grad is None:
+                            none_params.append(name)
+                        elif torch.isnan(param.grad).any():
+                            nan_params.append(name)
+                
+                if none_params:
+                    print(f"\nParameters with None gradients ({len(none_params)}):")
+                    for name in none_params:
+                        print(f"  - {name}")
+                        pass
+                
+                if nan_params:
+                    print(f"\nParameters with NaN gradients ({len(nan_params)}):")
+                    for name in nan_params:
+                        #print(f"  - {name}")
+                        pass
+                
+                if not none_params and not nan_params:
+                    print("\n✓ All sem_seg_head parameters have valid gradients")
+                
+                print("="*80 + "\n")
+                return grad
+            
+            #loss.register_hook(check_grads_hook)
+
             losses = {"loss_sem_seg" : loss}
+            
+            # Collect MoE loss from Conv-LoRA layers (if enabled)
+            moe_loss = collect_conv_lora_moe_loss(self)
+            #print("MOE LOSS:---------------------------------", moe_loss)
+            if moe_loss.item() > 0:
+                losses["loss_conv_lora_moe"] = moe_loss
+            
             return losses
 
         else:
